@@ -6,14 +6,14 @@
 /** 工艺：吹制 / 铸造 / 热塑 */
 export type Craft = '吹制' | '铸造' | '热塑'
 
-/** 作品状态：设计中 / 制作中 / 已退火 / 已检验 */
-export type PieceState = '设计中' | '制作中' | '已退火' | '已检验'
+/** 作品状态：设计中 / 制作中 / 已退火 / 待重烧 / 已检验 */
+export type PieceState = '设计中' | '制作中' | '已退火' | '待重烧' | '已检验'
 
 export const CRAFT_OPTIONS: Craft[] = ['吹制', '铸造', '热塑']
-export const PIECE_STATE_OPTIONS: PieceState[] = ['设计中', '制作中', '已退火', '已检验']
+export const PIECE_STATE_OPTIONS: PieceState[] = ['设计中', '制作中', '已退火', '待重烧', '已检验']
 
-/** 状态推进顺序 */
-export const PIECE_STATE_FLOW: PieceState[] = ['设计中', '制作中', '已退火', '已检验']
+/** 状态推进顺序（待重烧为质检退回重排的分支状态） */
+export const PIECE_STATE_FLOW: PieceState[] = ['设计中', '制作中', '已退火', '待重烧', '已检验']
 
 export interface Piece {
   id: string

@@ -1,6 +1,9 @@
 /**
- * 退火窑位与曲线状态管理（Pinia）
- * 维护窑位占用表与退火曲线段；窑位冲突时禁止提交，出炉即回写作品状态。
+ * 退火窑位与曲线状态管理（Pinia）——窑务排产员视角
+ * 维护排产账：窑位占用表、退火曲线段、入窑 / 出炉时刻、退火轮次。
+ * 窑位冲突时禁止提交；出炉即回写作品状态。
+ * 重烧单由质检账开具，排产员在「待排」队列里接收：另开一条 round+1 的炉次，
+ * 原炉排位保留不动。
  */
 import { computed, reactive, ref } from 'vue'
 import { defineStore } from 'pinia'
@@ -8,13 +11,19 @@ import { liveQuery } from 'dexie'
 import type { Anneal, AnnealDraft, AnnealState, CurveSeg } from '../types/anneal'
 import { ANNEAL_STATE_FLOW } from '../types/anneal'
 import type { Piece } from '../types/piece'
+import type { Refire } from '../types/refire'
 import {
   ROW_REVISION,
   advanceAnnealState,
   db,
+  holdRefire,
   initDatabase,
   putAnneal,
+  reconcileAndHold,
+  refreshRefireStates,
   removeAnneal,
+  scheduleRefire,
+  unholdRefire,
 } from '../utils/db'
 import {
   checkSlotConflict,
@@ -32,6 +41,8 @@ export interface AnnealFilters {
   state: AnnealState | 'all'
   curveSeg: CurveSeg | 'all'
   kilnCode: string | 'all'
+  /** 是否只看重烧炉次（round > 1） */
+  refireOnly: boolean
 }
 
 /** 窑位占用行 */
@@ -44,17 +55,19 @@ export interface SlotOccupancy {
   inAt: string
   outAt: string
   state: AnnealState
+  round: number
   /** 该窑位当前是否被未出炉记录占用 */
   occupied: boolean
 }
 
-const EMPTY_FILTERS: AnnealFilters = { keyword: '', state: 'all', curveSeg: 'all', kilnCode: 'all' }
+const EMPTY_FILTERS: AnnealFilters = { keyword: '', state: 'all', curveSeg: 'all', kilnCode: 'all', refireOnly: false }
 
 let subscribed = false
 
 export const useAnnealStore = defineStore('anneal', () => {
   const anneals = ref<Anneal[]>([])
   const pieces = ref<Piece[]>([])
+  const refires = ref<Refire[]>([])
   const loading = ref(true)
   const ready = ref(false)
   const error = ref('')
@@ -94,6 +107,7 @@ export const useAnnealStore = defineStore('anneal', () => {
           inAt: row.inAt,
           outAt: row.outAt,
           state: row.state,
+          round: row.round,
           occupied: row.state !== '已出炉',
         }
       })
@@ -106,12 +120,19 @@ export const useAnnealStore = defineStore('anneal', () => {
     return total === 0 ? 0 : Math.round((occupiedSlotCount.value / total) * 1000) / 10
   })
 
+  /** 质检判完、等排产员接收的重烧队列（原炉确已出炉） */
+  const waitingRefires = computed<Refire[]>(() => refires.value.filter((row) => row.state === '待排'))
+  /** 原炉还在烧、暂不打断在烧炉次的重烧单 */
+  const firingRefires = computed<Refire[]>(() => refires.value.filter((row) => row.state === '待出炉'))
+  const heldRefires = computed<Refire[]>(() => refires.value.filter((row) => row.state === '挂起'))
+
   const visibleAnneals = computed<Anneal[]>(() => {
     const keyword = filters.keyword.trim().toLowerCase()
     return anneals.value.filter((row) => {
       if (filters.state !== 'all' && row.state !== filters.state) return false
       if (filters.curveSeg !== 'all' && row.curveSeg !== filters.curveSeg) return false
       if (filters.kilnCode !== 'all' && !row.kilnSlot.startsWith(filters.kilnCode)) return false
+      if (filters.refireOnly && row.round <= 1) return false
       if (keyword === '') return true
       const piece = pieces.value.find((item) => item.id === row.pieceId)
       return (
@@ -141,15 +162,21 @@ export const useAnnealStore = defineStore('anneal', () => {
     error.value = ''
     try {
       await initDatabase()
+      await refreshRefireStates().catch(() => undefined)
       if (!subscribed) {
         subscribed = true
         liveQuery(async () => {
-          const [annealRows, pieceRows] = await Promise.all([db.anneals.toArray(), db.pieces.toArray()])
-          return { annealRows, pieceRows }
+          const [annealRows, pieceRows, refireRows] = await Promise.all([
+            db.anneals.toArray(),
+            db.pieces.toArray(),
+            db.refires.toArray(),
+          ])
+          return { annealRows, pieceRows, refireRows }
         }).subscribe({
-          next: ({ annealRows, pieceRows }) => {
+          next: ({ annealRows, pieceRows, refireRows }) => {
             anneals.value = [...annealRows].sort((a, b) => a.inAt.localeCompare(b.inAt))
             pieces.value = pieceRows
+            refires.value = [...refireRows].sort((a, b) => a.createdAt.localeCompare(b.createdAt))
             loading.value = false
             ready.value = true
             error.value = ''
@@ -196,6 +223,10 @@ export const useAnnealStore = defineStore('anneal', () => {
       inAt: draft.inAt,
       outAt: draft.outAt,
       state: draft.state,
+      // 排产员手动排位为首烧第 1 轮；重烧另开由 scheduleRefire 处理
+      round: 1,
+      sourceRefireId: '',
+      sourceAnnealId: '',
       createdAt: stamp,
       updatedAt: stamp,
       revision: ROW_REVISION,
@@ -231,17 +262,18 @@ export const useAnnealStore = defineStore('anneal', () => {
       state: draft.state,
     })
     revision.value += 1
-    lastMessage.value = '退火编排已更新'
+    lastMessage.value =
+      existing.round > 1 ? `第 ${existing.round} 轮重烧编排已更新（原炉排位保留）` : '退火编排已更新'
     return true
   }
 
   async function deleteAnneal(annealId: string): Promise<void> {
     await removeAnneal(annealId)
     revision.value += 1
-    lastMessage.value = '退火记录已删除'
+    lastMessage.value = '退火记录已删除；若它是重烧炉次，对应重烧单已退回待排，原炉排位仍保留'
   }
 
-  /** 推进退火状态；「已出炉」写回出炉时间并同步作品状态 */
+  /** 推进退火状态；「已出炉」写回出炉时间并同步作品状态与重烧单完成态 */
   async function advance(annealId: string): Promise<AnnealState | null> {
     const existing = anneals.value.find((row) => row.id === annealId)
     if (existing === undefined) return null
@@ -250,14 +282,73 @@ export const useAnnealStore = defineStore('anneal', () => {
     const next = ANNEAL_STATE_FLOW[index + 1]
     await advanceAnnealState(annealId, next, nowLocalInput())
     revision.value += 1
-    lastMessage.value =
-      next === '已出炉' ? '已登记出炉，作品状态已回写为「已退火」' : `退火状态已推进为「${next}」`
+    if (next === '已出炉') {
+      if (existing.round > 1) {
+        lastMessage.value = '重烧炉次已出炉，重烧单标记完成；可在检验页登记复检'
+      } else if (existing.sourceRefireId === '') {
+        // 检查是否有等待这一炉出炉的重烧单（同作品更早轮次的缺陷单不会有，兜底对账）
+        await refreshRefireStates().catch(() => undefined)
+        lastMessage.value = '已登记出炉，作品状态已回写为「已退火」，可登记出炉检验'
+      } else {
+        lastMessage.value = '已登记出炉'
+      }
+    } else {
+      lastMessage.value = `退火状态已推进为「${next}」`
+    }
     return next
+  }
+
+  /**
+   * 接收质检退回的重烧单并另开炉次（round + 1），原炉排位保留。
+   * 先做窑位冲突校验（在烧炉次占着窑位时重烧只能换时段 / 换窑位，避免撞车）。
+   */
+  async function scheduleFromRefire(refireId: string, draft: AnnealDraft): Promise<Anneal | null> {
+    const conflict = checkSlotConflict(
+      anneals.value,
+      { id: '', ...draft },
+      wallThicknessOf,
+      '',
+    )
+    if (conflict.conflict) {
+      lastMessage.value = `重烧排位撞车：${conflict.message}`
+      return null
+    }
+    try {
+      const { anneal } = await scheduleRefire(refireId, draft)
+      revision.value += 1
+      lastMessage.value = `已为重烧单另开第 ${anneal.round} 轮炉次（窑位 ${anneal.kilnSlot}），原炉排位保留不动`
+      return anneal
+    } catch (err) {
+      lastMessage.value = err instanceof Error ? err.message : '重烧排产失败'
+      return null
+    }
+  }
+
+  async function holdRefireById(refireId: string, reason: string): Promise<void> {
+    await holdRefire(refireId, reason)
+    revision.value += 1
+    lastMessage.value = '重烧单已挂起'
+  }
+
+  async function unholdRefireById(refireId: string): Promise<void> {
+    const updated = await unholdRefire(refireId)
+    revision.value += 1
+    lastMessage.value = updated === null ? '重烧单不存在' : `重烧单已解挂，回到「${updated.state}」`
+  }
+
+  /** 排产侧按作品 + 窑位对账（件数对不上自动挂起） */
+  async function reconcile(): Promise<void> {
+    const result = await reconcileAndHold()
+    const errorCount = result.issues.filter((issue) => issue.level === 'error').length
+    lastMessage.value =
+      errorCount === 0 ? '两本账对账一致' : `对账发现 ${errorCount} 处不符，相关重烧单已挂起`
+    revision.value += 1
   }
 
   return {
     anneals,
     pieces,
+    refires,
     loading,
     ready,
     error,
@@ -269,6 +360,9 @@ export const useAnnealStore = defineStore('anneal', () => {
     occupancy,
     occupiedSlotCount,
     occupancyRate,
+    waitingRefires,
+    firingRefires,
+    heldRefires,
     visibleAnneals,
     wallThicknessOf,
     conflictOf,
@@ -280,5 +374,9 @@ export const useAnnealStore = defineStore('anneal', () => {
     updateAnneal,
     deleteAnneal,
     advance,
+    scheduleFromRefire,
+    holdRefireById,
+    unholdRefireById,
+    reconcile,
   }
 })

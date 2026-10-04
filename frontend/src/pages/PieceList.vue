@@ -61,6 +61,7 @@ const stats = computed(() => ({
   designing: pieceStore.pieces.filter((row) => row.state === '设计中').length,
   working: pieceStore.pieces.filter((row) => row.state === '制作中').length,
   annealed: pieceStore.pieces.filter((row) => row.state === '已退火').length,
+  refiring: pieceStore.pieces.filter((row) => row.state === '待重烧').length,
   inspected: pieceStore.pieces.filter((row) => row.state === '已检验').length,
   avgThickness:
     pieceStore.pieces.length === 0
@@ -157,6 +158,7 @@ function handleFilterChange(key: string, value: string): void {
       <StatBadge label="设计中" :value="stats.designing" suffix="件" tone="info" icon="DataLine" />
       <StatBadge label="制作中" :value="stats.working" suffix="件" tone="warning" icon="TrendCharts" />
       <StatBadge label="已退火" :value="stats.annealed" suffix="件" tone="primary" icon="Histogram" />
+      <StatBadge label="待重烧" :value="stats.refiring" suffix="件" tone="danger" icon="RefreshRight" />
       <StatBadge label="已检验" :value="stats.inspected" suffix="件" tone="success" icon="PieChart" />
       <StatBadge label="平均壁厚" :value="stats.avgThickness" suffix="mm" tone="default" icon="TrendCharts" />
     </div>

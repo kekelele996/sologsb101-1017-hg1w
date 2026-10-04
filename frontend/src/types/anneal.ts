@@ -1,6 +1,8 @@
 /**
- * 退火（Anneal）
- * 窑位分配与曲线段编排；窑位时间窗冲突时禁用提交，出炉即回写作品状态。
+ * 退火（Anneal）——排产账
+ * 窑务排产员独管：窑位、曲线段、入窑 / 出炉时刻、退火轮次。
+ * 窑位时间窗冲突时禁用提交，出炉即回写作品状态。
+ * 重烧另开一条记录（round + 1），原始炉次排位永久保留、不复用。
  */
 
 /** 退火曲线段：升温 / 保温 / 缓冷 */
@@ -29,12 +31,18 @@ export interface Anneal {
   outAt: string
   /** 退火状态 */
   state: AnnealState
+  /** 退火轮次：1 = 首烧，2 起为第 N 次重烧（重烧另开一条，不覆盖原炉排位） */
+  round: number
+  /** 由哪张重烧单开窑（仅重烧记录有值，首烧为空串） */
+  sourceRefireId: string
+  /** 重烧追溯的上一炉退火记录（仅重烧记录有值） */
+  sourceAnnealId: string
   createdAt: string
   updatedAt: string
   revision: number
 }
 
-/** 新建 / 编辑退火的表单草稿 */
+/** 新建 / 编辑退火的表单草稿（轮次与重烧链由排产动作自动赋值，不在表单里手填） */
 export interface AnnealDraft {
   pieceId: string
   kilnSlot: string

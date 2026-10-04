@@ -1,11 +1,11 @@
 <script setup lang="ts">
 /**
  * <StageTag> 作品阶段标签
- * 按 设计中 / 制作中 / 已退火 / 已检验 渲染阶段底色与图标，被作品页、工序页、退火页消费。
+ * 按 设计中 / 制作中 / 已退火 / 待重烧 / 已检验 渲染阶段底色与图标，被作品页、工序页、退火页、检验页消费。
  */
 import { computed } from 'vue'
 import type { Component } from 'vue'
-import { Brush, Check, EditPen, Loading } from '@element-plus/icons-vue'
+import { Brush, Check, EditPen, Loading, RefreshRight } from '@element-plus/icons-vue'
 import type { Craft, PieceState } from '@/types/piece'
 import type { FurnaceState } from '@/types/furnace'
 
@@ -32,6 +32,7 @@ const TYPE_MAP: Record<PieceState, TagType> = {
   设计中: 'info',
   制作中: 'warning',
   已退火: 'primary',
+  待重烧: 'warning',
   已检验: 'success',
 }
 
@@ -39,6 +40,7 @@ const ICON_MAP: Record<PieceState, Component> = {
   设计中: EditPen,
   制作中: Loading,
   已退火: Brush,
+  待重烧: RefreshRight,
   已检验: Check,
 }
 
@@ -46,6 +48,7 @@ const HINT_MAP: Record<PieceState, string> = {
   设计中: '仅完成设计尺寸登记，尚未开始吹制工序',
   制作中: '吹制工序进行中，前序未完成时无法进入退火排位',
   已退火: '退火已完成出炉，等待出炉检验',
+  待重烧: '质检判重烧已退回排产：原炉排位保留，重烧另开一炉（在烧炉次不打断）',
   已检验: '已完成出炉检验并归档',
 }
 

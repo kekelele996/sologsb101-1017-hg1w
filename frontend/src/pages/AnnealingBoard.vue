@@ -1,8 +1,9 @@
 <script setup lang="ts">
 /**
- * /annealing 退火窑位分配与曲线编排
- * 窑位冲突时禁用提交；出炉即回写作品状态为「已退火」。
- * 消费模型：Anneal、Piece、Furnace；复用组件：<FilterBar>、<StatBadge>、<StageTag>、<EmptyPanel>
+ * /annealing 退火窑位分配与曲线编排（排产账）
+ * 窑位冲突时禁用提交；出炉即回写作品状态为「已退火」，重烧炉次出炉则关闭重烧单。
+ * 质检判完退回的重烧单在「待排队列」接收：另开第 N+1 轮炉次，原炉排位保留。
+ * 消费模型：Anneal、Piece、Furnace、Refire；复用组件：<FilterBar>、<StatBadge>、<StageTag>、<EmptyPanel>
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
@@ -14,6 +15,7 @@ import { useAnnealStore } from '@/stores/annealStore'
 import { useFurnaceStore } from '@/stores/furnaceStore'
 import { usePieceStore } from '@/stores/pieceStore'
 import { ANNEAL_STATE_OPTIONS, CURVE_SEG_OPTIONS, type Anneal, type AnnealDraft, type AnnealState, type CurveSeg } from '@/types/anneal'
+import type { Refire } from '@/types/refire'
 import { ANNEAL_CURVE, formatHours, segmentHours, totalAnnealHours } from '@/utils/thermal'
 import { nowLocalInput } from '@/utils/id'
 
@@ -24,6 +26,8 @@ const furnaceStore = useFurnaceStore()
 const dialogVisible = ref(false)
 const submitting = ref(false)
 const editingId = ref<string | null>(null)
+/** 非空表示弹窗处于「接收重烧单另开炉次」模式 */
+const schedulingRefireId = ref<string>('')
 const formRef = ref<FormInstance>()
 
 const form = reactive<AnnealDraft>({
@@ -60,7 +64,7 @@ const slotOptions = computed<string[]>(() => {
   return list
 })
 
-/** 当前表单的窑位冲突检测结果，冲突时禁用提交 */
+/** 当前表单的窑位冲突检测，冲突时禁用提交 */
 const conflict = computed(() =>
   annealStore.conflictOf({
     id: editingId.value ?? '',
@@ -87,6 +91,9 @@ const stats = computed(() => ({
   waiting: annealStore.anneals.filter((row) => row.state === '待入窑').length,
   firing: annealStore.anneals.filter((row) => row.state === '退火中').length,
   done: annealStore.anneals.filter((row) => row.state === '已出炉').length,
+  refiresWaiting: annealStore.waitingRefires.length,
+  refiresFiring: annealStore.firingRefires.length,
+  held: annealStore.heldRefires.length,
 }))
 
 onMounted(() => {
@@ -96,6 +103,7 @@ onMounted(() => {
 })
 
 function openCreate(): void {
+  schedulingRefireId.value = ''
   editingId.value = null
   Object.assign(form, {
     pieceId: pieceStore.currentPieceId ?? pieceStore.pieces[0]?.id ?? '',
@@ -108,7 +116,23 @@ function openCreate(): void {
   dialogVisible.value = true
 }
 
+/** 接收质检退回的重烧单：原炉排位保留，只新开第 N+1 轮 */
+function openScheduleRefire(refire: Refire): void {
+  schedulingRefireId.value = refire.id
+  editingId.value = null
+  Object.assign(form, {
+    pieceId: refire.pieceId,
+    kilnSlot: refire.sourceKilnSlot,
+    curveSeg: '缓冷' as CurveSeg,
+    inAt: nowLocalInput(),
+    outAt: '',
+    state: '待入窑' as AnnealState,
+  })
+  dialogVisible.value = true
+}
+
 function openEdit(row: Anneal): void {
+  schedulingRefireId.value = ''
   editingId.value = row.id
   Object.assign(form, {
     pieceId: row.pieceId,
@@ -131,7 +155,14 @@ async function handleSubmit(): Promise<void> {
   }
   submitting.value = true
   try {
-    if (editingId.value === null) {
+    if (schedulingRefireId.value !== '') {
+      const row = await annealStore.scheduleFromRefire(schedulingRefireId.value, { ...form })
+      if (row === null) {
+        ElMessage.error(annealStore.lastMessage)
+        return
+      }
+      ElMessage.success(annealStore.lastMessage)
+    } else if (editingId.value === null) {
       const row = await annealStore.createAnneal({ ...form })
       if (row === null) {
         ElMessage.error(annealStore.lastMessage)
@@ -154,16 +185,18 @@ async function handleSubmit(): Promise<void> {
 
 async function handleDelete(row: Anneal): Promise<void> {
   try {
-    await ElMessageBox.confirm(`确认删除窑位 ${row.kilnSlot} 的退火记录？`, '删除确认', {
-      type: 'warning',
-      confirmButtonText: '删除',
-      cancelButtonText: '取消',
-    })
+    await ElMessageBox.confirm(
+      row.round > 1
+        ? `确认删除第 ${row.round} 轮重烧炉次（${row.kilnSlot}）？原炉排位保留，重烧单会退回「待排」。`
+        : `确认删除窑位 ${row.kilnSlot} 的退火记录？`,
+      '删除确认',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
+    )
   } catch {
     return
   }
   await annealStore.deleteAnneal(row.id)
-  ElMessage.success('退火记录已删除')
+  ElMessage.success(annealStore.lastMessage)
 }
 
 async function handleAdvance(row: Anneal): Promise<void> {
@@ -175,20 +208,46 @@ async function handleAdvance(row: Anneal): Promise<void> {
   ElMessage.success(annealStore.lastMessage)
 }
 
-function handleFilterChange(key: string, value: string): void {
+async function handleUnhold(refire: Refire): Promise<void> {
+  await annealStore.unholdRefireById(refire.id)
+  ElMessage.success(annealStore.lastMessage)
+}
+
+async function handleReconcile(): Promise<void> {
+  await annealStore.reconcile()
+  ElMessage.success(annealStore.lastMessage)
+}
+
+function handleFilterChange(key: string, value: string | boolean): void {
   if (key === 'state') annealStore.setFilters({ state: value as AnnealState | 'all' })
   if (key === 'curveSeg') annealStore.setFilters({ curveSeg: value as CurveSeg | 'all' })
-  if (key === 'kilnCode') annealStore.setFilters({ kilnCode: value })
+  if (key === 'kilnCode') annealStore.setFilters({ kilnCode: value as string })
+  if (key === 'refireOnly') annealStore.setFilters({ refireOnly: value as boolean })
 }
+
+const schedulingRefire = computed<Refire | null>(
+  () => annealStore.refires.find((row) => row.id === schedulingRefireId.value) ?? null,
+)
+
+/** 重烧新开炉次的轮次说明（原炉 round + 1） */
+const schedulingRoundText = computed<string>(() => {
+  const refire = schedulingRefire.value
+  if (refire === null) return ''
+  const sourceRound = annealStore.anneals.find((item) => item.id === refire.sourceAnnealId)?.round ?? 1
+  return `第 ${sourceRound + 1} 轮`
+})
 </script>
 
 <template>
   <div>
     <div class="stat-row">
-      <StatBadge label="退火记录" :value="stats.total" suffix="条" tone="primary" icon="Histogram" />
+      <StatBadge label="退火炉次" :value="stats.total" suffix="条" tone="primary" icon="Histogram" />
       <StatBadge label="待入窑" :value="stats.waiting" suffix="条" tone="info" icon="DataLine" />
       <StatBadge label="退火中" :value="stats.firing" suffix="条" tone="warning" icon="TrendCharts" />
       <StatBadge label="已出炉" :value="stats.done" suffix="条" tone="success" icon="PieChart" />
+      <StatBadge label="重烧待排" :value="stats.refiresWaiting" suffix="张" tone="danger" icon="RefreshRight" />
+      <StatBadge label="等出炉" :value="stats.refiresFiring" suffix="张" tone="warning" icon="Timer" />
+      <StatBadge label="挂起" :value="stats.held" suffix="张" tone="info" icon="Lock" />
       <StatBadge
         label="窑位占用率"
         :value="`${annealStore.occupancyRate}%`"
@@ -198,6 +257,76 @@ function handleFilterChange(key: string, value: string): void {
         :hint="`已占用 ${annealStore.occupiedSlotCount} / ${annealStore.allSlots.length} 个窑位`"
       />
     </div>
+
+    <!-- 质检退回的重烧交接单：原炉确出炉 → 待排（可接收）；原炉在烧 → 等出炉（不打断） -->
+    <el-card
+      v-if="annealStore.waitingRefires.length > 0 || annealStore.firingRefires.length > 0 || annealStore.heldRefires.length > 0"
+      shadow="never"
+      class="mb-14"
+    >
+      <template #header>
+        <div class="card-header">
+          <span class="card-header__title">重烧交接单（来自质检账）</span>
+          <el-space>
+            <el-tag type="danger" effect="plain">待排 {{ annealStore.waitingRefires.length }}</el-tag>
+            <el-tag type="warning" effect="plain">等出炉 {{ annealStore.firingRefires.length }}</el-tag>
+            <el-tag type="info" effect="plain">挂起 {{ annealStore.heldRefires.length }}</el-tag>
+            <el-button size="small" @click="handleReconcile">按作品+窑位对账</el-button>
+          </el-space>
+        </div>
+      </template>
+
+      <el-table :data="annealStore.refires.filter((row) => row.state !== '已完成')" row-key="id" size="small" stripe>
+        <el-table-column label="作品" min-width="150">
+          <template #default="{ row }">
+            <el-link type="primary" @click="$router.push(`/pieces/${row.pieceId}/steps`)">
+              {{ pieceName[row.pieceId] ?? '（作品已删除）' }}
+            </el-link>
+          </template>
+        </el-table-column>
+        <el-table-column prop="defectResult" label="缺陷" width="80" />
+        <el-table-column label="原炉排位（保留）" min-width="220">
+          <template #default="{ row }">
+            <div class="cell-stack">
+              <span>{{ row.sourceKilnSlot }} · {{ row.sourceInAt.replace('T', ' ') }}</span>
+              <span class="cell-sub">
+                出炉：{{ row.sourceOutAt === '' ? '原炉仍在烧，不打断本炉' : row.sourceOutAt.replace('T', ' ') }}
+              </span>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="状态 / 挂起原因" min-width="200">
+          <template #default="{ row }">
+            <el-tag
+              size="small"
+              effect="dark"
+              :type="row.state === '待排' ? 'danger' : row.state === '待出炉' ? 'warning' : 'info'"
+            >
+              {{ row.state }}
+            </el-tag>
+            <div v-if="row.holdReason !== ''" class="cell-warn">{{ row.holdReason }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="200" fixed="right">
+          <template #default="{ row }">
+            <el-button
+              v-if="row.state === '待排'"
+              link
+              type="primary"
+              size="small"
+              @click="openScheduleRefire(row)"
+            >
+              接收并重开一炉
+
+            </el-button>
+            <el-button v-if="row.state === '挂起'" link type="success" size="small" @click="handleUnhold(row)">
+              核对无误，解挂
+            </el-button>
+            <span v-if="row.state === '待出炉'" class="cell-sub">等原炉出炉</span>
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-card>
 
     <el-alert
       v-if="annealStore.lastMessage !== ''"
@@ -211,11 +340,19 @@ function handleFilterChange(key: string, value: string): void {
     <el-card shadow="never">
       <template #header>
         <div class="card-header">
-          <span class="card-header__title">退火窑位分配与曲线编排</span>
-          <el-button type="primary" @click="openCreate" :disabled="pieceStore.pieces.length === 0 || slotOptions.length === 0">
-            <el-icon><Plus /></el-icon>
-            <span>分配窑位</span>
-          </el-button>
+          <span class="card-header__title">退火窑位分配与曲线编排（排产账）</span>
+          <el-space>
+            <el-checkbox
+              :model-value="annealStore.filters.refireOnly"
+              @change="(value: string | number | boolean) => handleFilterChange('refireOnly', Boolean(value))"
+            >
+              只看重烧炉次
+            </el-checkbox>
+            <el-button type="primary" @click="openCreate" :disabled="pieceStore.pieces.length === 0 || slotOptions.length === 0">
+              <el-icon><Plus /></el-icon>
+              <span>分配窑位</span>
+            </el-button>
+          </el-space>
         </div>
       </template>
 
@@ -246,7 +383,7 @@ function handleFilterChange(key: string, value: string): void {
       />
 
       <el-table v-else v-loading="!annealStore.ready" :data="annealStore.visibleAnneals" row-key="id" stripe>
-        <el-table-column label="作品" min-width="190">
+        <el-table-column label="作品" min-width="180">
           <template #default="{ row }">
             <div class="cell-stack">
               <el-link type="primary" @click="$router.push(`/pieces/${row.pieceId}/steps`)">
@@ -264,8 +401,14 @@ function handleFilterChange(key: string, value: string): void {
             <StageTag :stage="pieceStore.pieces.find((item) => item.id === row.pieceId)?.state ?? null" size="small" />
           </template>
         </el-table-column>
-        <el-table-column prop="kilnSlot" label="窑位" width="130" />
-        <el-table-column label="曲线段" width="120">
+        <el-table-column label="轮次" width="100">
+          <template #default="{ row }">
+            <el-tag v-if="row.round > 1" size="small" type="danger" effect="dark">第 {{ row.round }} 轮重烧</el-tag>
+            <el-tag v-else size="small" type="info">首烧</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="kilnSlot" label="窑位" width="120" />
+        <el-table-column label="曲线段" width="100">
           <template #default="{ row }">
             <el-tag
               size="small"
@@ -275,21 +418,21 @@ function handleFilterChange(key: string, value: string): void {
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="该段时长" width="120" align="right">
+        <el-table-column label="该段时长" width="110" align="right">
           <template #default="{ row }">
             {{ formatHours(segmentHours(row.curveSeg, annealStore.wallThicknessOf(row.pieceId))) }}
           </template>
         </el-table-column>
-        <el-table-column label="入窑时间" width="160">
+        <el-table-column label="入窑时间" width="150">
           <template #default="{ row }">{{ row.inAt.replace('T', ' ') }}</template>
         </el-table-column>
-        <el-table-column label="出炉时间" width="160">
+        <el-table-column label="出炉时间" width="150">
           <template #default="{ row }">
             <span v-if="row.outAt === ''" class="cell-sub">未出炉</span>
             <span v-else>{{ row.outAt.replace('T', ' ') }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="状态" width="110">
+        <el-table-column label="状态" width="100">
           <template #default="{ row }">
             <el-tag
               size="small"
@@ -327,6 +470,7 @@ function handleFilterChange(key: string, value: string): void {
           <template v-for="row in annealStore.occupancy.filter((item) => item.kilnSlot === slot)" :key="row.annealId">
             <div class="slot-detail">
               {{ row.pieceName }} · {{ row.curveSeg }} · {{ row.state }}
+              <el-tag v-if="row.round > 1" size="small" type="danger" effect="plain">重{{ row.round }}</el-tag>
             </div>
           </template>
           <div v-if="annealStore.occupancy.filter((item) => item.kilnSlot === slot).length === 0" class="slot-detail is-free">
@@ -336,12 +480,25 @@ function handleFilterChange(key: string, value: string): void {
       </div>
     </el-card>
 
-    <el-dialog v-model="dialogVisible" :title="editingId === null ? '分配退火窑位' : '编辑退火编排'" width="660px">
+    <el-dialog
+      v-model="dialogVisible"
+      :title="schedulingRefireId !== '' ? '接收重烧单：另开一炉（原炉排位保留）' : editingId === null ? '分配退火窑位' : '编辑退火编排'"
+      width="660px"
+    >
+      <el-alert
+        v-if="schedulingRefire !== null"
+        type="warning"
+        show-icon
+        :closable="false"
+        class="mb-14"
+        :title="`质检判「${schedulingRefire.defectResult}」退回重排：${schedulingRefire.defectNote}`"
+        :description="`原炉 ${schedulingRefire.sourceKilnSlot} 排位保留不动；本次另开一炉（${schedulingRoundText}），窑位时间窗冲突时禁止提交。`"
+      />
       <el-form ref="formRef" :model="form" :rules="rules" label-width="120px">
         <el-row :gutter="12">
           <el-col :span="12">
             <el-form-item label="作品" prop="pieceId">
-              <el-select v-model="form.pieceId" filterable style="width: 100%">
+              <el-select v-model="form.pieceId" filterable style="width: 100%" :disabled="schedulingRefireId !== ''">
                 <el-option
                   v-for="item in pieceStore.pieces"
                   :key="item.id"
@@ -417,7 +574,7 @@ function handleFilterChange(key: string, value: string): void {
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
         <el-button type="primary" :loading="submitting" :disabled="conflict.conflict" @click="handleSubmit">
-          保存
+          {{ schedulingRefireId !== '' ? '另开重烧炉次' : '保存' }}
         </el-button>
       </template>
     </el-dialog>
@@ -457,6 +614,11 @@ function handleFilterChange(key: string, value: string): void {
   color: #8b95a1;
 }
 
+.cell-warn {
+  font-size: 12px;
+  color: #c0392b;
+}
+
 .slot-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
@@ -486,6 +648,9 @@ function handleFilterChange(key: string, value: string): void {
   font-size: 12px;
   line-height: 1.6;
   color: #5b6b7a;
+  display: flex;
+  align-items: center;
+  gap: 4px;
 }
 
 .slot-detail.is-free {

@@ -10,6 +10,7 @@ import type { Piece } from '../types/piece'
 import type { Step } from '../types/step'
 import type { Anneal } from '../types/anneal'
 import type { Inspect } from '../types/inspect'
+import type { Refire } from '../types/refire'
 
 const SEED_TIME = '2026-09-01T02:00:00.000Z'
 
@@ -27,6 +28,7 @@ export const SEED_IDS = {
   piecePaperweight: 'piece-sunset-weight',
   pieceBottle: 'piece-frost-bottle',
   pieceCup: 'piece-red-cup',
+  pieceDish: 'piece-ice-dish',
 } as const
 
 function wrap<T>(row: Omit<T, 'createdAt' | 'updatedAt' | 'revision'>): T {
@@ -52,13 +54,14 @@ export async function seedDatabase(): Promise<void> {
     wrap<GlassBatch>({ id: SEED_IDS.batchClear, furnaceId: SEED_IDS.furnaceCrucible, colorCode: 'T-045', recipe: '高透钠钙玻璃（无着色剂）', meltDate: '2026-09-05', tempC: 1170, remainKg: 88 }),
   ]
 
-  // ---------------- 作品（5 件，覆盖四种状态与三种工艺） ----------------
+  // ---------------- 作品（6 件，覆盖五种状态与三种工艺） ----------------
   const pieces: Piece[] = [
     wrap<Piece>({ id: SEED_IDS.pieceMorning, name: '晨雾花器', batchId: SEED_IDS.batchAmber, designHeightMm: 260, wallThicknessMm: 4.5, craft: '吹制', artist: '林曦', state: '制作中' }),
     wrap<Piece>({ id: SEED_IDS.pieceGreen, name: '叠翠碗', batchId: SEED_IDS.batchCopper, designHeightMm: 180, wallThicknessMm: 6, craft: '铸造', artist: '沈沐', state: '已检验' }),
     wrap<Piece>({ id: SEED_IDS.piecePaperweight, name: '流霞镇纸', batchId: SEED_IDS.batchIron, designHeightMm: 120, wallThicknessMm: 8, craft: '热塑', artist: '郑野', state: '制作中' }),
     wrap<Piece>({ id: SEED_IDS.pieceBottle, name: '霜白长颈瓶', batchId: SEED_IDS.batchClear, designHeightMm: 340, wallThicknessMm: 3.2, craft: '吹制', artist: '林曦', state: '已检验' }),
-    wrap<Piece>({ id: SEED_IDS.pieceCup, name: '赤霞杯', batchId: SEED_IDS.batchAmber, designHeightMm: 95, wallThicknessMm: 3.5, craft: '吹制', artist: '沈沐', state: '已退火' }),
+    wrap<Piece>({ id: SEED_IDS.pieceCup, name: '赤霞杯', batchId: SEED_IDS.batchAmber, designHeightMm: 95, wallThicknessMm: 3.5, craft: '吹制', artist: '沈沐', state: '待重烧' }),
+    wrap<Piece>({ id: SEED_IDS.pieceDish, name: '冰花盘', batchId: SEED_IDS.batchCopper, designHeightMm: 210, wallThicknessMm: 5, craft: '吹制', artist: '郑野', state: '待重烧' }),
   ]
 
   // ---------------- 吹制工序（每件 2–5 道，seq 连续） ----------------
@@ -80,29 +83,88 @@ export async function seedDatabase(): Promise<void> {
     wrap<Step>({ id: 'step-c1', pieceId: SEED_IDS.pieceCup, seq: 1, name: '取料', tempC: 1180, durationMin: 3, operator: '沈沐', remark: '取 G-101 料液约 2.4 kg', state: '已完成' }),
     wrap<Step>({ id: 'step-c2', pieceId: SEED_IDS.pieceCup, seq: 2, name: '吹制', tempC: 1130, durationMin: 5.5, operator: '沈沐', remark: '杯身一次成型', state: '已完成' }),
     wrap<Step>({ id: 'step-c3', pieceId: SEED_IDS.pieceCup, seq: 3, name: '塑形', tempC: 1000, durationMin: 8, operator: '林曦', remark: '接杯柄并回火', state: '已完成' }),
+    wrap<Step>({ id: 'step-d1', pieceId: SEED_IDS.pieceDish, seq: 1, name: '取料', tempC: 1120, durationMin: 5, operator: '郑野', remark: '取 C-330 料液约 7.4 kg', state: '已完成' }),
+    wrap<Step>({ id: 'step-d2', pieceId: SEED_IDS.pieceDish, seq: 2, name: '吹制', tempC: 1090, durationMin: 8, operator: '郑野', remark: '盘面旋压成型', state: '已完成' }),
+    wrap<Step>({ id: 'step-d3', pieceId: SEED_IDS.pieceDish, seq: 3, name: '开模', tempC: 920, durationMin: 7, operator: '沈沐', remark: '圆盘模脱模', state: '已完成' }),
   ]
 
-  // ---------------- 退火（4 条，窑位互不冲突；含已出炉 / 退火中 / 待入窑） ----------------
+  // ---------------- 退火（7 条；含首烧 / 重烧第二轮，已出炉 / 退火中 / 待入窑） ----------------
   const anneals: Anneal[] = [
-    wrap<Anneal>({ id: 'anneal-g1', pieceId: SEED_IDS.pieceGreen, kilnSlot: 'AN-01-A1', curveSeg: '缓冷', inAt: '2026-09-20T09:00', outAt: '2026-09-21T09:00', state: '已出炉' }),
-    wrap<Anneal>({ id: 'anneal-b1', pieceId: SEED_IDS.pieceBottle, kilnSlot: 'AN-01-A2', curveSeg: '缓冷', inAt: '2026-09-26T08:00', outAt: '2026-09-27T08:00', state: '已出炉' }),
-    wrap<Anneal>({ id: 'anneal-c1', pieceId: SEED_IDS.pieceCup, kilnSlot: 'AN-01-A3', curveSeg: '升温', inAt: '2026-09-29T14:00', outAt: '', state: '退火中' }),
-    wrap<Anneal>({ id: 'anneal-m1', pieceId: SEED_IDS.pieceMorning, kilnSlot: 'AN-01-B1', curveSeg: '保温', inAt: '2026-10-02T10:00', outAt: '', state: '待入窑' }),
+    // 叠翠碗：首烧裂纹 → 重烧第 2 轮已出炉复检合格
+    wrap<Anneal>({ id: 'anneal-g1', pieceId: SEED_IDS.pieceGreen, kilnSlot: 'AN-01-A1', curveSeg: '缓冷', inAt: '2026-09-20T09:00', outAt: '2026-09-21T09:00', state: '已出炉', round: 1, sourceRefireId: '', sourceAnnealId: '' }),
+    wrap<Anneal>({ id: 'anneal-g2', pieceId: SEED_IDS.pieceGreen, kilnSlot: 'AN-01-B2', curveSeg: '缓冷', inAt: '2026-09-23T20:00', outAt: '2026-09-24T22:00', state: '已出炉', round: 2, sourceRefireId: 'refire-g1', sourceAnnealId: 'anneal-g1' }),
+    wrap<Anneal>({ id: 'anneal-b1', pieceId: SEED_IDS.pieceBottle, kilnSlot: 'AN-01-A2', curveSeg: '缓冷', inAt: '2026-09-26T08:00', outAt: '2026-09-27T08:00', state: '已出炉', round: 1, sourceRefireId: '', sourceAnnealId: '' }),
+    // 赤霞杯：退火中即质检跟踪判气泡，重烧单待出炉，不打断在烧的这一炉
+    wrap<Anneal>({ id: 'anneal-c1', pieceId: SEED_IDS.pieceCup, kilnSlot: 'AN-01-A3', curveSeg: '升温', inAt: '2026-10-03T08:00', outAt: '', state: '退火中', round: 1, sourceRefireId: '', sourceAnnealId: '' }),
+    // 冰花盘：首烧出炉即判变形，重烧单已退回待排，等排产员另开一炉
+    wrap<Anneal>({ id: 'anneal-d1', pieceId: SEED_IDS.pieceDish, kilnSlot: 'AN-01-B1', curveSeg: '缓冷', inAt: '2026-10-01T10:00', outAt: '2026-10-02T12:00', state: '已出炉', round: 1, sourceRefireId: '', sourceAnnealId: '' }),
+    wrap<Anneal>({ id: 'anneal-m1', pieceId: SEED_IDS.pieceMorning, kilnSlot: 'AN-01-C1', curveSeg: '保温', inAt: '2026-10-05T10:00', outAt: '', state: '待入窑', round: 1, sourceRefireId: '', sourceAnnealId: '' }),
   ]
 
-  // ---------------- 出炉检验（2–3 条，含不合格与返工后复检合格） ----------------
+  // ---------------- 出炉检验（挂在具体那一炉上；含合格 / 裂纹 / 气泡 / 变形） ----------------
   const inspects: Inspect[] = [
-    wrap<Inspect>({ id: 'inspect-b1', pieceId: SEED_IDS.pieceBottle, result: '合格', defectNote: '', inspector: '吴岚', date: '2026-09-28' }),
-    wrap<Inspect>({ id: 'inspect-g1', pieceId: SEED_IDS.pieceGreen, result: '裂纹', defectNote: '口沿下方 12 mm 处有细裂纹，需回炉修补；原始工序记录保留不变。', inspector: '吴岚', date: '2026-09-22' }),
-    wrap<Inspect>({ id: 'inspect-g2', pieceId: SEED_IDS.pieceGreen, result: '合格', defectNote: '回炉修补后复检合格。', inspector: '吴岚', date: '2026-09-25' }),
+    wrap<Inspect>({
+      id: 'inspect-b1', pieceId: SEED_IDS.pieceBottle, annealId: 'anneal-b1', kilnSlot: 'AN-01-A2',
+      inAt: '2026-09-26T08:00', outAt: '2026-09-27T08:00', result: '合格', defectNote: '',
+      inspector: '吴岚', date: '2026-09-28', refireId: '', readOnly: false,
+    }),
+    wrap<Inspect>({
+      id: 'inspect-g1', pieceId: SEED_IDS.pieceGreen, annealId: 'anneal-g1', kilnSlot: 'AN-01-A1',
+      inAt: '2026-09-20T09:00', outAt: '2026-09-21T09:00', result: '裂纹',
+      defectNote: '口沿下方 12 mm 处有细裂纹，需回炉修补；原始工序记录保留不变。',
+      inspector: '吴岚', date: '2026-09-22', refireId: 'refire-g1', readOnly: false,
+    }),
+    wrap<Inspect>({
+      id: 'inspect-g2', pieceId: SEED_IDS.pieceGreen, annealId: 'anneal-g2', kilnSlot: 'AN-01-B2',
+      inAt: '2026-09-23T20:00', outAt: '2026-09-24T22:00', result: '合格', defectNote: '重烧第 2 轮复检合格。',
+      inspector: '吴岚', date: '2026-09-25', refireId: '', readOnly: false,
+    }),
+    wrap<Inspect>({
+      id: 'inspect-c1', pieceId: SEED_IDS.pieceCup, annealId: 'anneal-c1', kilnSlot: 'AN-01-A3',
+      inAt: '2026-10-03T08:00', outAt: '', result: '气泡',
+      defectNote: '杯身中段可见密集小气泡，判定重烧；原炉仍在烧，不打断本炉，等出炉后退回待排。',
+      inspector: '吴岚', date: '2026-10-03', refireId: 'refire-c1', readOnly: false,
+    }),
+    wrap<Inspect>({
+      id: 'inspect-d1', pieceId: SEED_IDS.pieceDish, annealId: 'anneal-d1', kilnSlot: 'AN-01-B1',
+      inAt: '2026-10-01T10:00', outAt: '2026-10-02T12:00', result: '变形',
+      defectNote: '盘心下凹超过 4 mm，判定重烧；原炉已出炉，排位保留，重烧另开一炉。',
+      inspector: '吴岚', date: '2026-10-02', refireId: 'refire-d1', readOnly: false,
+    }),
   ]
 
-  await db.transaction('rw', [db.furnaces, db.batches, db.pieces, db.steps, db.anneals, db.inspects], async () => {
+  // ---------------- 重烧交接单（已完成 / 待出炉 / 待排 三个环节各一） ----------------
+  const refires: Refire[] = [
+    wrap<Refire>({
+      id: 'refire-g1', pieceId: SEED_IDS.pieceGreen, inspectId: 'inspect-g1',
+      sourceAnnealId: 'anneal-g1', sourceKilnSlot: 'AN-01-A1',
+      sourceInAt: '2026-09-20T09:00', sourceOutAt: '2026-09-21T09:00',
+      defectResult: '裂纹', defectNote: '口沿下方 12 mm 处有细裂纹，需回炉修补。',
+      reAnnealId: 'anneal-g2', reKilnSlot: 'AN-01-B2', state: '已完成', holdReason: '', retryCount: 0,
+    }),
+    wrap<Refire>({
+      id: 'refire-c1', pieceId: SEED_IDS.pieceCup, inspectId: 'inspect-c1',
+      sourceAnnealId: 'anneal-c1', sourceKilnSlot: 'AN-01-A3',
+      sourceInAt: '2026-10-03T08:00', sourceOutAt: '',
+      defectResult: '气泡', defectNote: '杯身中段密集小气泡，等本炉出炉后退回待排。',
+      reAnnealId: '', reKilnSlot: '', state: '待出炉', holdReason: '', retryCount: 0,
+    }),
+    wrap<Refire>({
+      id: 'refire-d1', pieceId: SEED_IDS.pieceDish, inspectId: 'inspect-d1',
+      sourceAnnealId: 'anneal-d1', sourceKilnSlot: 'AN-01-B1',
+      sourceInAt: '2026-10-01T10:00', sourceOutAt: '2026-10-02T12:00',
+      defectResult: '变形', defectNote: '盘心下凹超过 4 mm，等待重新排位。',
+      reAnnealId: '', reKilnSlot: '', state: '待排', holdReason: '', retryCount: 0,
+    }),
+  ]
+
+  await db.transaction('rw', [db.furnaces, db.batches, db.pieces, db.steps, db.anneals, db.inspects, db.refires], async () => {
     await db.furnaces.bulkPut(furnaces)
     await db.batches.bulkPut(batches)
     await db.pieces.bulkPut(pieces)
     await db.steps.bulkPut(steps)
     await db.anneals.bulkPut(anneals)
     await db.inspects.bulkPut(inspects)
+    await db.refires.bulkPut(refires)
   })
 }

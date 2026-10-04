@@ -10,6 +10,7 @@ import type { Piece } from '../types/piece'
 import type { Step } from '../types/step'
 import type { Anneal } from '../types/anneal'
 import type { Inspect } from '../types/inspect'
+import type { Refire } from '../types/refire'
 import { stampSuffix } from './id'
 import { formatHours, isLowRemain, segmentHours, totalAnnealHours } from './thermal'
 
@@ -67,6 +68,7 @@ export function parseSnapshot(text: string): SnapshotParseResult {
       snapshot: null,
     }
   }
+  // refires 为 v3 新增表，旧版存档没有；缺失时由 db.normalizeSnapshot 兜底为空数组
   const keys: Array<keyof DatabaseSnapshot> = ['furnaces', 'batches', 'pieces', 'steps', 'anneals', 'inspects']
   for (const key of keys) {
     if (!Array.isArray(data[key])) {
@@ -84,6 +86,7 @@ export function buildScheduleCsv(
   steps: Step[],
   anneals: Anneal[],
   inspects: Inspect[],
+  refires: Refire[] = [],
 ): string {
   const header = [
     '作品名',
@@ -97,9 +100,12 @@ export function buildScheduleCsv(
     '工序数',
     '已完成工序',
     '累计工时(分钟)',
-    '退火记录数',
-    '退火窑位',
+    '退火炉次数',
+    '当前轮次',
+    '最新窑位',
     '退火状态',
+    '在途重烧单',
+    '重烧单状态',
     '理论退火时长',
     '检验次数',
     '最近检验结果',
@@ -109,10 +115,20 @@ export function buildScheduleCsv(
     const batch = batches.find((row) => row.id === piece.batchId)
     const furnace = furnaces.find((row) => row.id === batch?.furnaceId)
     const pieceSteps = steps.filter((row) => row.pieceId === piece.id).sort((a, b) => a.seq - b.seq)
-    const pieceAnneals = anneals.filter((row) => row.pieceId === piece.id)
+    const pieceAnneals = anneals.filter((row) => row.pieceId === piece.id).sort((a, b) => a.round - b.round)
     const latestAnneal = pieceAnneals.length > 0 ? pieceAnneals[pieceAnneals.length - 1] : null
-    const pieceInspects = inspects.filter((row) => row.pieceId === piece.id).sort((a, b) => a.date.localeCompare(b.date))
+    const pieceInspects = inspects
+      .filter((row) => row.pieceId === piece.id && !row.readOnly)
+      .sort((a, b) => a.date.localeCompare(b.date))
     const latestInspect = pieceInspects.length > 0 ? pieceInspects[pieceInspects.length - 1] : null
+    const activeRefire = refires.find(
+      (row) => row.pieceId === piece.id && row.state !== '已完成' && row.state !== '挂起',
+    )
+    const heldRefire =
+      activeRefire === undefined
+        ? refires.find((row) => row.pieceId === piece.id && row.state === '挂起')
+        : undefined
+    const refireCell = activeRefire ?? heldRefire
     lines.push(
       [
         piece.name,
@@ -127,8 +143,11 @@ export function buildScheduleCsv(
         pieceSteps.filter((row) => row.state === '已完成').length,
         Math.round(pieceSteps.reduce((acc, row) => acc + row.durationMin, 0) * 10) / 10,
         pieceAnneals.length,
+        latestAnneal ? `第 ${latestAnneal.round} 轮` : '—',
         latestAnneal?.kilnSlot ?? '—',
         latestAnneal?.state ?? '—',
+        refireCell ? `${refireCell.defectResult}（${refireCell.sourceKilnSlot}）` : '—',
+        refireCell?.state ?? '—',
         formatHours(totalAnnealHours(piece.wallThicknessMm)),
         pieceInspects.length,
         latestInspect?.result ?? '—',
@@ -148,9 +167,10 @@ export function exportScheduleCsvFile(
   steps: Step[],
   anneals: Anneal[],
   inspects: Inspect[],
+  refires: Refire[] = [],
 ): string {
   const filename = `玻璃窑务排产汇总-${stampSuffix()}.csv`
-  download(filename, buildScheduleCsv(furnaces, batches, pieces, steps, anneals, inspects), 'text/csv;charset=utf-8')
+  download(filename, buildScheduleCsv(furnaces, batches, pieces, steps, anneals, inspects, refires), 'text/csv;charset=utf-8')
   return filename
 }
 
@@ -199,9 +219,16 @@ export function buildStepCardText(
     })
   if (anneals.length > 0) {
     lines.push('退火：')
-    anneals.forEach((row) => {
-      lines.push(`  ${row.kilnSlot} · ${row.curveSeg} · ${row.inAt} → ${row.outAt || '未出炉'} · ${row.state}`)
-    })
+    anneals
+      .slice()
+      .sort((a, b) => a.round - b.round)
+      .forEach((row) => {
+        lines.push(
+          `  第 ${row.round} 轮 · ${row.kilnSlot} · ${row.curveSeg} · ${row.inAt} → ${row.outAt || '未出炉'} · ${row.state}${
+            row.sourceRefireId === '' ? '' : `（重烧单 ${row.sourceRefireId}）`
+          }`,
+        )
+      })
   }
   return lines.join('\n')
 }

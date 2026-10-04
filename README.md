@@ -42,7 +42,7 @@ docker compose up -d --build       # 改完代码后重新构建
 | 构建 | Vite 6 | 开发端口与宿主端口一致（22817） |
 | 路由 | Vue Router 4 | `createWebHistory` + 路由懒加载 |
 | 状态管理 | Pinia 2 | setup store，跨页状态集中在 store，页面只读 store |
-| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbglassblow`，`v1 → v2` 为 Piece 增加 craft 索引并回填默认值 |
+| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbglassblow`，当前 `v3`：v1→v2 为 Piece 增加 craft 索引；v2→v3 两本账分离 + 重烧单，老检验按当时退火记录回填挂账窑位 |
 | 容器 | node:20-alpine → nginx:alpine | 多阶段构建，`chmod -R a+rX` 规避静态资源 403 |
 
 ---
@@ -69,8 +69,8 @@ sologsb101-1017/
         ├── App.vue             # 外壳：顶部导航 + 当前作品上下文 + 页脚
         ├── env.d.ts
         ├── styles/main.css
-        ├── types/              # furnace.ts batch.ts piece.ts step.ts anneal.ts inspect.ts
-        ├── stores/             # furnaceStore.ts pieceStore.ts annealStore.ts
+        ├── types/              # furnace.ts batch.ts piece.ts step.ts anneal.ts inspect.ts refire.ts
+        ├── stores/             # furnaceStore.ts pieceStore.ts annealStore.ts inspectStore.ts
         ├── components/common/  # StageTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue
         ├── hooks/              # useStepProgress.ts useIdbTable.ts
         ├── pages/              # 5 个模块页面
@@ -87,8 +87,8 @@ sologsb101-1017/
 | `/furnaces` | `pages/FurnaceList.vue` | 窑炉与料液台账：新建/编辑/级联删除窑炉、登记料液批次、取料按剩余量扣减、低于阈值高亮提示补料 |
 | `/pieces` | `pages/PieceList.vue` | 作品登记与设计尺寸录入：按工艺与状态筛选、设计尺寸比例校验、显示工序完成度与当前道次 |
 | `/pieces/:id/steps` | `pages/StepDetail.vue` | 吹制工序逐道记录：拖拽排序、回填温度/时长/操作人、推进工序状态、前序未完成阻断进入退火排位 |
-| `/annealing` | `pages/AnnealingBoard.vue` | 退火窑位分配与曲线编排：窑位占用表、**窑位冲突时禁用提交**、状态流转、出炉回写作品状态 |
-| `/export` | `pages/ExportView.vue` | 出炉检验登记（不合格生成返工提示）+ JSON 结构版本查看与导入导出 + 窑务 CSV 汇总 |
+| `/annealing` | `pages/AnnealingBoard.vue` | 退火窑位分配与曲线编排（**排产账**）：窑位占用表、**窑位冲突时禁用提交**、状态流转、出炉回写作品状态；接收质检退回的**重烧待排队列**另开第 N+1 轮炉次（原炉排位保留） |
+| `/export` | `pages/ExportView.vue` | 出炉检验登记（**质检账**：按作品挂到那一炉 + 窑位快照，判重烧只开重烧单不动排产账）、重烧交接单与两本账对账挂起、JSON 结构版本查看与导入导出、窑务 CSV 汇总 |
 
 `/` 重定向到 `/furnaces`，未匹配路径统一回落到 `/furnaces`。
 **层级路由支持直接深链**：把 `http://localhost:22817/pieces/piece-morning-vase/steps` 直接粘贴到地址栏即可打开；
@@ -100,34 +100,51 @@ sologsb101-1017/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbglassblow`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`
   * `db.version(1)`：建立全部表与 `[pieceId+seq]` 复合索引；
   * `db.version(2)`：**为 `Piece` 增加 `craft` 索引并回填默认值**，同时补齐其余索引与字段：
     * `.upgrade()` 中逐行回填 `revision` / `createdAt` / `updatedAt`；
     * `pieces.craft` 缺失时回填 `吹制`，`pieces.state` 缺失时回填 `设计中`；
     * `steps.state` 缺失时按历史记录视为 `已完成`，避免升级后被误判为待办；
     * `anneals` 补齐 `outAt` 与 `curveSeg`，`inspects` 补齐 `defectNote`。
+  * `db.version(3)`：**排产账与质检账分离，新增重烧交接单 `refires` 表**：
+    * `anneals` 增加 `round`（退火轮次，重烧 +1）、`sourceRefireId` / `sourceAnnealId`（重烧链）；
+    * `inspects` 增加 `annealId` + `kilnSlot` / `inAt` / `outAt`（按作品挂到那一炉的窑位快照）、`refireId`、`readOnly`；
+    * **老检验回填**：`.upgrade()` 中按「作品当时的退火记录」回填挂账炉次（取检验日当天或之前、出炉日期最接近的一炉）；
+      一炉都找不到或无法判定的老记录置 `readOnly = true`，**只读、不参与重烧交接与挂起**，不翻历史账补开重烧单；
+    * 旧版 JSON 存档导入时走同一套回填归一化（`normalizeSnapshot`）。
+* **两本账与重烧交接**：
+  * **排产账 `anneals`**（窑务排产员独管）：窑位、曲线段、入窑 / 出炉时刻、退火轮次；
+  * **质检账 `inspects` + `refires`**（质检员独管）：检验结论、缺陷说明、按作品 + 窑位挂账、重烧交接单。
+  * 判重烧：质检登记在质检账事务内写 `inspects` + `refires`，**失败只按本侧重试（最多 3 次），全程不写 `anneals`**。
+  * 不打断在烧炉次：原炉为「退火中」时重烧单先挂「待出炉」，该炉**确实出炉**后自动转「待排」；
+    原炉已出炉则判完即「待排」。排产员接收后**另开一条** `round + 1` 的退火记录，**原炉排位保留**，窑位时间窗冲突禁止提交。
+* **对账挂起**：两本账按「作品 + 窑位」核对（`utils/reconcile.ts`，纯函数）。原炉缺失、作品不一致、
+  窑位快照不符、重烧链断裂、同一原炉多张重烧单、按作品件数恒等式不符时产出 issue 并把对应重烧单**自动挂起**；
+  老只读记录只报 info。挂起单可在两页「核对无误，解挂」，按原炉 / 重烧炉次实际状态回到对应环节。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
   | --- | --- | --- |
   | `furnaces` | id | code, type, state, fuelType, createdAt, updatedAt |
   | `batches` | id | furnaceId, colorCode, meltDate, remainKg |
-  | `pieces` | id | batchId, state, artist, **craft**, name |
+  | `pieces` | id | batchId, state, artist, craft, name |
   | `steps` | id | pieceId, **[pieceId+seq]**, seq, state, name |
-  | `anneals` | id | pieceId, kilnSlot, state, inAt, curveSeg |
-  | `inspects` | id | pieceId, date, result, inspector |
+  | `anneals`（排产账） | id | pieceId, kilnSlot, state, inAt, curveSeg, round, sourceRefireId |
+  | `inspects`（质检账） | id | pieceId, **annealId**, date, result, inspector, readOnly |
+  | `refires`（交接单） | id | pieceId, inspectId, sourceAnnealId, reAnnealId, state |
 
 * **首屏演示数据**：`initDatabase()` 在打开数据库后检测 `furnaces` 表是否为空，为空则调用 `utils/seed.ts` 播种，
   幂等且只执行一次。播种链路为 **窑炉 → 料液批次 → 作品 → 吹制工序 → 退火 → 出炉检验** 三层互相引用：
   * 3 台窑炉（KILN-01 熔化炉 / KILN-02 坩埚炉 / AN-01 退火窑）；
   * 4 批料液（含 `A-207` 剩余 42 kg，故意低于 60 kg 补料阈值用于验证高亮与提醒）；
-  * 5 件作品（覆盖四种状态与三种工艺）、17 道吹制工序（每件 2–5 道，seq 连续）；
-  * 4 条退火记录（窑位 A1/A2/A3/B1 互不冲突，覆盖已出炉 / 退火中 / 待入窑）；
-  * 3 条出炉检验（含一条「裂纹」不合格 + 一条返工后复检合格）。
+  * 6 件作品（覆盖设计中 / 制作中 / 已退火 / 待重烧 / 已检验五种状态与三种工艺）、20 道吹制工序；
+  * 6 条退火记录（首烧 + 第 2 轮重烧，窑位互不冲突，覆盖已出炉 / 退火中 / 待入窑）；
+  * 5 条出炉检验（合格 / 裂纹 / 气泡 / 变形，均挂在具体炉次与窑位上）+ 3 张重烧交接单，
+    分别演示「待出炉（在烧不打断）/ 待排（已退回排产员）/ 已完成（重烧复检合格）」三个环节。
   * 固定 id 如 `piece-morning-vase`、`piece-frost-bottle` 可直接用于深链验证。
 * **其他本地数据**：`localStorage` 仅保存「最近选中的作品 id」这一界面偏好，不存业务数据。
-* 删除窑炉会级联清理其料液批次；删除作品会级联清理其工序、退火与检验记录（均在同一 Dexie 事务内完成）。
+* 删除窑炉会级联清理其料液批次；删除作品会级联清理其工序、退火、检验与重烧单（均在同一 Dexie 事务内完成）。
 
 ---
 
@@ -162,6 +179,7 @@ npm run preview      # 预览 dist 产物
 * **工序温度校验**：不得超过所选窑炉的 `maxTempC`，且应落在工艺适宜区间（吹制 900–1200 ℃ / 铸造 800–1150 ℃ / 热塑 700–1000 ℃）附近。
 * **设计尺寸校验**：壁厚需 ≥ 1.5 mm 且小于设计高度的 1/8，否则给出成型与退火难度提示。
 * **前序阻断**：任一前序工序未推进到「已完成」，`/pieces/:id/steps` 的「进入退火排位」会给出明确阻断原因。
-* **状态回写**：退火状态推进到「已出炉」即把作品状态回写为「已退火」；登记出炉检验后回写为「已检验」；
-  判定不合格时生成返工提示，**原始工序记录完整保留**。
+* **状态回写**：退火状态推进到「已出炉」即把作品状态回写为「已退火」；登记合格检验后回写为「已检验」；
+  判定重烧（且重烧未走完）时回写为「待重烧」，重烧炉次出炉、复检前回到「已退火」等待复检。
+  判定重烧只开重烧单，**原始工序记录与原炉排位完整保留**。
 * **料液扣减**：取料按剩余量扣减（不足时扣到 0），剩余量低于 60 kg 时列表行高亮并在顶部汇总提醒。

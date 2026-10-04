@@ -9,6 +9,7 @@ import { Box, DocumentChecked, Odometer, SetUp, Sunrise } from '@element-plus/ic
 import { useFurnaceStore } from '@/stores/furnaceStore'
 import { usePieceStore } from '@/stores/pieceStore'
 import { useAnnealStore } from '@/stores/annealStore'
+import { useInspectStore } from '@/stores/inspectStore'
 import { ROUTES } from '@/router'
 
 const route = useRoute()
@@ -16,6 +17,7 @@ const router = useRouter()
 const furnaceStore = useFurnaceStore()
 const pieceStore = usePieceStore()
 const annealStore = useAnnealStore()
+const inspectStore = useInspectStore()
 
 const navItems = computed(() => {
   const currentPieceId = pieceStore.currentPieceId
@@ -30,7 +32,7 @@ const navItems = computed(() => {
       disabled: currentPieceId === null,
     },
     { path: ROUTES.annealing, label: '退火编排', icon: Sunrise, badge: String(annealStore.anneals.length) },
-    { path: ROUTES.export, label: '检验归档', icon: DocumentChecked, badge: String(pieceStore.counts.inspects ?? 0) },
+    { path: ROUTES.export, label: '检验归档', icon: DocumentChecked, badge: String(inspectStore.inspects.length) },
   ]
 })
 
@@ -48,6 +50,7 @@ onMounted(() => {
   void furnaceStore.loadAll()
   void pieceStore.loadAll()
   void annealStore.loadAll()
+  void inspectStore.loadAll()
 })
 
 function go(path: string): void {
@@ -62,7 +65,7 @@ function go(path: string): void {
         <span class="app-header__mark">玻</span>
         <div>
           <h1 class="app-header__title">玻璃吹制工序与退火窑编排台</h1>
-          <p class="app-header__sub">gbglassblow · 窑炉料液 · 逐道工序 · 退火窑位 · 出炉检验</p>
+          <p class="app-header__sub">gbglassblow · 窑炉料液 · 逐道工序 · 退火窑位 · 出炉检验 · 重烧交接</p>
         </div>
       </div>
       <nav class="app-nav">
