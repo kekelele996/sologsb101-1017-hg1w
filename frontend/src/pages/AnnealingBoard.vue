@@ -13,13 +13,19 @@ import StageTag from '@/components/common/StageTag.vue'
 import { useAnnealStore } from '@/stores/annealStore'
 import { useFurnaceStore } from '@/stores/furnaceStore'
 import { usePieceStore } from '@/stores/pieceStore'
+import { useReworkStore } from '@/stores/reworkStore'
+import { useInspectStore } from '@/stores/inspectStore'
+import ReconcilePanel from '@/components/common/ReconcilePanel.vue'
 import { ANNEAL_STATE_OPTIONS, CURVE_SEG_OPTIONS, type Anneal, type AnnealDraft, type AnnealState, type CurveSeg } from '@/types/anneal'
 import { ANNEAL_CURVE, formatHours, segmentHours, totalAnnealHours } from '@/utils/thermal'
+import { reconcile } from '@/utils/reconcile'
 import { nowLocalInput } from '@/utils/id'
 
 const annealStore = useAnnealStore()
 const pieceStore = usePieceStore()
 const furnaceStore = useFurnaceStore()
+const reworkStore = useReworkStore()
+const inspectStore = useInspectStore()
 
 const dialogVisible = ref(false)
 const submitting = ref(false)
@@ -89,10 +95,15 @@ const stats = computed(() => ({
   done: annealStore.anneals.filter((row) => row.state === '已出炉').length,
 }))
 
+/** 排产台账与质检台账按「作品 + 窑位」对账 */
+const reconcileResult = computed(() => reconcile(annealStore.anneals, inspectStore.inspects, pieceStore.pieces))
+
 onMounted(() => {
   void annealStore.loadAll()
   void pieceStore.loadAll()
   void furnaceStore.loadAll()
+  void reworkStore.loadAll()
+  void inspectStore.loadAll()
 })
 
 function openCreate(): void {
@@ -180,6 +191,11 @@ function handleFilterChange(key: string, value: string): void {
   if (key === 'curveSeg') annealStore.setFilters({ curveSeg: value as CurveSeg | 'all' })
   if (key === 'kilnCode') annealStore.setFilters({ kilnCode: value })
 }
+
+/** 重烧请求：查原炉窑位（用于展示「原炉排位保留」） */
+function slotOfAnneal(annealId: string): string {
+  return annealStore.anneals.find((row) => row.id === annealId)?.kilnSlot ?? '—'
+}
 </script>
 
 <template>
@@ -264,7 +280,14 @@ function handleFilterChange(key: string, value: string): void {
             <StageTag :stage="pieceStore.pieces.find((item) => item.id === row.pieceId)?.state ?? null" size="small" />
           </template>
         </el-table-column>
-        <el-table-column prop="kilnSlot" label="窑位" width="130" />
+        <el-table-column label="窑位" width="140">
+          <template #default="{ row }">
+            <div class="cell-stack">
+              <span>{{ row.kilnSlot }}</span>
+              <el-tag v-if="row.reworkOf !== ''" size="small" type="warning" effect="plain">重烧</el-tag>
+            </div>
+          </template>
+        </el-table-column>
         <el-table-column label="曲线段" width="120">
           <template #default="{ row }">
             <el-tag
@@ -334,6 +357,42 @@ function handleFilterChange(key: string, value: string): void {
           </div>
         </div>
       </div>
+    </el-card>
+
+    <!-- 重烧请求：质检判不合格后退回；待出炉的不打断在烧的那炉，出炉后重烧另开一条 -->
+    <el-card v-if="reworkStore.reworks.length > 0" shadow="never" class="mt-14">
+      <template #header>
+        <span class="card-header__title">重烧请求（质检判不合格后退回重排）</span>
+      </template>
+      <div class="rework-grid">
+        <div v-for="row in reworkStore.reworks" :key="row.id" class="rework-card" :class="{ 'is-pending': row.state === '待出炉' }">
+          <div class="rework-head">
+            <el-tag
+              size="small"
+              :type="row.state === '待出炉' ? 'warning' : row.state === '已退回待排' ? 'success' : 'info'"
+              effect="dark"
+            >
+              {{ row.state }}
+            </el-tag>
+            <span class="rework-reason">{{ row.reason }}重烧</span>
+          </div>
+          <div class="rework-body">
+            <div>{{ pieceName[row.pieceId] ?? '（作品已删除）' }}</div>
+            <div class="cell-sub">
+              原炉 {{ slotOfAnneal(row.originalAnnealId) }} 排位保留 →
+              {{ row.state === '待出炉' ? '在烧炉出炉后另开一条' : '重烧另开一条' }}
+            </div>
+          </div>
+        </div>
+      </div>
+    </el-card>
+
+    <!-- 排产 · 质检对账 -->
+    <el-card shadow="never" class="mt-14">
+      <template #header>
+        <span class="card-header__title">排产 · 质检对账（按作品 + 窑位）</span>
+      </template>
+      <ReconcilePanel :result="reconcileResult" :loading="annealStore.loading || inspectStore.loading" />
     </el-card>
 
     <el-dialog v-model="dialogVisible" :title="editingId === null ? '分配退火窑位' : '编辑退火编排'" width="660px">
@@ -490,6 +549,45 @@ function handleFilterChange(key: string, value: string): void {
 
 .slot-detail.is-free {
   color: #a8b0b8;
+}
+
+.rework-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 10px;
+}
+
+.rework-card {
+  border: 1px solid #e4e7ed;
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: #fafcff;
+}
+
+.rework-card.is-pending {
+  border-color: #f0b27a;
+  background: #fff8f1;
+}
+
+.rework-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.rework-reason {
+  font-size: 13px;
+  font-weight: 600;
+  color: #1d2b3a;
+}
+
+.rework-body {
+  font-size: 13px;
+  color: #5b6b7a;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 
 .mt-14 {

@@ -14,6 +14,7 @@ import {
   db,
   initDatabase,
   putAnneal,
+  releaseReworksForPiece,
   removeAnneal,
 } from '../utils/db'
 import {
@@ -196,6 +197,8 @@ export const useAnnealStore = defineStore('anneal', () => {
       inAt: draft.inAt,
       outAt: draft.outAt,
       state: draft.state,
+      reworkOf: '',
+      sourceInspectId: '',
       createdAt: stamp,
       updatedAt: stamp,
       revision: ROW_REVISION,
@@ -241,7 +244,7 @@ export const useAnnealStore = defineStore('anneal', () => {
     lastMessage.value = '退火记录已删除'
   }
 
-  /** 推进退火状态；「已出炉」写回出炉时间并同步作品状态 */
+  /** 推进退火状态；「已出炉」写回出炉时间并同步作品状态，同时释放等待中的重烧请求 */
   async function advance(annealId: string): Promise<AnnealState | null> {
     const existing = anneals.value.find((row) => row.id === annealId)
     if (existing === undefined) return null
@@ -249,9 +252,20 @@ export const useAnnealStore = defineStore('anneal', () => {
     if (index < 0 || index >= ANNEAL_STATE_FLOW.length - 1) return null
     const next = ANNEAL_STATE_FLOW[index + 1]
     await advanceAnnealState(annealId, next, nowLocalInput())
+    let released = 0
+    if (next === '已出炉') {
+      // 在烧的那炉确实出炉了：把待出炉的重烧请求退回待排（重烧另开一条，原炉排位保留）
+      released = await releaseReworksForPiece(existing.pieceId)
+    }
     revision.value += 1
-    lastMessage.value =
-      next === '已出炉' ? '已登记出炉，作品状态已回写为「已退火」' : `退火状态已推进为「${next}」`
+    if (next === '已出炉') {
+      lastMessage.value =
+        released > 0
+          ? `已登记出炉，作品状态已回写为「已退火」；${released} 条重烧请求已退回待排（重烧另开一条，原炉排位保留）`
+          : '已登记出炉，作品状态已回写为「已退火」'
+    } else {
+      lastMessage.value = `退火状态已推进为「${next}」`
+    }
     return next
   }
 

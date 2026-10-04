@@ -11,18 +11,20 @@ import type { GlassBatch } from '../types/batch'
 import type { Piece, PieceState } from '../types/piece'
 import type { Step } from '../types/step'
 import type { Anneal } from '../types/anneal'
-import type { Inspect } from '../types/inspect'
-import { nowIso } from './id'
+import type { Inspect, InspectResult } from '../types/inspect'
+import { needsRework } from '../types/inspect'
+import type { ReworkRequest, ReworkState } from '../types/rework'
+import { nowIso, uuid } from './id'
 import { seedDatabase } from './seed'
 
 /** 数据库名 */
 export const DB_NAME = 'gbglassblow'
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2
+export const DB_SCHEMA_VERSION = 3
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
 
 class GlassBlowDatabase extends Dexie {
   furnaces!: Table<Furnace, string>
@@ -31,6 +33,7 @@ class GlassBlowDatabase extends Dexie {
   steps!: Table<Step, string>
   anneals!: Table<Anneal, string>
   inspects!: Table<Inspect, string>
+  reworks!: Table<ReworkRequest, string>
 
   constructor() {
     super(DB_NAME)
@@ -46,7 +49,7 @@ class GlassBlowDatabase extends Dexie {
     })
 
     // ---------- v2：Piece 增加 craft 索引并回填默认值，补齐其余索引与字段 ----------
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         furnaces: 'id, code, type, state, fuelType, createdAt, updatedAt',
         batches: 'id, furnaceId, colorCode, meltDate, remainKg',
@@ -91,6 +94,80 @@ class GlassBlowDatabase extends Dexie {
         // 迁移 5：检验记录补齐缺陷说明
         await tx.table('inspects').toCollection().modify((row: Record<string, unknown>) => {
           if (typeof row.defectNote !== 'string') row.defectNote = ''
+        })
+      })
+
+    // ---------- v3：质检台账挂到「那一炉」（annealId + kilnSlot），新增重烧请求 ----------
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        furnaces: 'id, code, type, state, fuelType, createdAt, updatedAt',
+        batches: 'id, furnaceId, colorCode, meltDate, remainKg',
+        pieces: 'id, batchId, state, artist, craft, name',
+        steps: 'id, pieceId, [pieceId+seq], seq, state, name',
+        anneals: 'id, pieceId, kilnSlot, state, inAt, curveSeg, reworkOf, sourceInspectId',
+        inspects: 'id, pieceId, date, result, inspector, annealId, kilnSlot',
+        reworks: 'id, pieceId, sourceInspectId, originalAnnealId, state, newAnnealId',
+      })
+      .upgrade(async (tx) => {
+        // 迁移 1：行修订号补齐到当前版本
+        const tables = [
+          tx.table('furnaces'),
+          tx.table('batches'),
+          tx.table('pieces'),
+          tx.table('steps'),
+          tx.table('anneals'),
+          tx.table('inspects'),
+          tx.table('reworks'),
+        ]
+        for (const table of tables) {
+          await table.toCollection().modify((row: Record<string, unknown>) => {
+            row.revision = ROW_REVISION
+            if (typeof row.createdAt !== 'string') row.createdAt = nowIso()
+            if (typeof row.updatedAt !== 'string') row.updatedAt = row.createdAt
+          })
+        }
+        // 迁移 2：检验记录按作品当时的退火记录回填窑位（挂到那一炉上）
+        const inspectTable = tx.table('inspects')
+        const annealTable = tx.table('anneals')
+        const inspectRows = (await inspectTable.toArray()) as Array<Record<string, unknown>>
+        const annealRows = (await annealTable.toArray()) as Array<Record<string, unknown>>
+        for (const inspect of inspectRows) {
+          const alreadyLinked = typeof inspect.annealId === 'string' && inspect.annealId !== ''
+          if (alreadyLinked) {
+            if (typeof inspect.kilnSlot !== 'string') inspect.kilnSlot = ''
+            if (typeof inspect.readonly !== 'boolean') inspect.readonly = false
+            await inspectTable.put(inspect)
+            continue
+          }
+          // 按作品当时的退火记录回填：同作品、已出炉、出炉日期不晚于检验日期，取最近一炉
+          const inspectDate = typeof inspect.date === 'string' ? inspect.date : ''
+          const candidates = annealRows
+            .filter(
+              (a) =>
+                a.pieceId === inspect.pieceId &&
+                a.state === '已出炉' &&
+                typeof a.outAt === 'string' &&
+                a.outAt !== '' &&
+                a.outAt.slice(0, 10) <= inspectDate,
+            )
+            .sort((a, b) => String(b.outAt).localeCompare(String(a.outAt)))
+          const match = candidates[0]
+          if (match) {
+            inspect.annealId = match.id
+            inspect.kilnSlot = match.kilnSlot
+            inspect.readonly = false
+          } else {
+            // 对不上窑位的老记录：只读，不参与对账写回
+            inspect.annealId = ''
+            inspect.kilnSlot = ''
+            inspect.readonly = true
+          }
+          await inspectTable.put(inspect)
+        }
+        // 迁移 3：退火记录补齐重烧关联字段
+        await annealTable.toCollection().modify((row: Record<string, unknown>) => {
+          if (typeof row.reworkOf !== 'string') row.reworkOf = ''
+          if (typeof row.sourceInspectId !== 'string') row.sourceInspectId = ''
         })
       })
   }
@@ -173,12 +250,13 @@ export async function putPiece(row: Piece): Promise<void> {
   await db.pieces.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION })
 }
 
-/** 删除作品：级联清理工序、退火与检验记录 */
+/** 删除作品：级联清理工序、退火、检验与重烧请求 */
 export async function removePiece(id: string): Promise<void> {
-  await db.transaction('rw', db.pieces, db.steps, db.anneals, db.inspects, async () => {
+  await db.transaction('rw', db.pieces, db.steps, db.anneals, db.inspects, db.reworks, async () => {
     await db.steps.where('pieceId').equals(id).delete()
     await db.anneals.where('pieceId').equals(id).delete()
     await db.inspects.where('pieceId').equals(id).delete()
+    await db.reworks.where('pieceId').equals(id).delete()
     await db.pieces.delete(id)
   })
 }
@@ -295,6 +373,128 @@ export async function removeInspect(id: string): Promise<void> {
   await syncPieceState(row.pieceId)
 }
 
+/* ------------------------------ 重烧请求 ------------------------------ */
+
+export async function listReworks(): Promise<ReworkRequest[]> {
+  return db.reworks.toArray()
+}
+
+export async function putRework(row: ReworkRequest): Promise<void> {
+  await db.reworks.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION })
+}
+
+/** 构造一条退回待排的重烧退火记录（待入窑，重烧另开一条，原炉排位保留） */
+function buildReworkAnneal(pieceId: string, original: Anneal, sourceInspectId: string, stamp: string): Anneal {
+  return {
+    id: uuid('anneal'),
+    pieceId,
+    kilnSlot: original.kilnSlot,
+    curveSeg: original.curveSeg,
+    inAt: '',
+    outAt: '',
+    state: '待入窑',
+    reworkOf: original.id,
+    sourceInspectId,
+    createdAt: stamp,
+    updatedAt: stamp,
+    revision: ROW_REVISION,
+  }
+}
+
+/**
+ * 质检判不合格后生成重烧请求。
+ * - 不打断在烧的那炉：若作品当前有「退火中」的退火记录，重烧请求置为「待出炉」，暂不开新炉；
+ * - 否则立即退回待排：新开一条退火记录（待入窑，reworkOf 指向原炉），原炉排位保留不动。
+ * 同一检验只生成一条重烧请求；检验合格 / 原炉缺失 / 只读老记录返回 null。
+ */
+export async function createReworkRequest(sourceInspectId: string): Promise<ReworkRequest | null> {
+  return db.transaction('rw', db.reworks, db.anneals, db.inspects, async () => {
+    const inspect = await db.inspects.get(sourceInspectId)
+    if (!inspect || inspect.readonly) return null
+    if (!needsRework(inspect.result)) return null
+    if (inspect.annealId === '') return null
+    const original = await db.anneals.get(inspect.annealId)
+    if (!original) return null
+
+    // 同一检验只生成一条重烧请求
+    const existing = await db.reworks.where('sourceInspectId').equals(sourceInspectId).first()
+    if (existing) return existing
+
+    const stamp = nowIso()
+    let newAnnealId = ''
+    let state: ReworkState = '待出炉'
+    const activeCount = await db.anneals
+      .where('pieceId')
+      .equals(inspect.pieceId)
+      .filter((a) => a.state === '退火中')
+      .count()
+    if (activeCount === 0) {
+      // 没有在烧的炉：立即退回待排，重烧另开一条（原炉排位保留）
+      const newAnneal = buildReworkAnneal(inspect.pieceId, original, inspect.id, stamp)
+      newAnnealId = newAnneal.id
+      await db.anneals.put(newAnneal)
+      state = '已退回待排'
+    }
+
+    const rework: ReworkRequest = {
+      id: uuid('rework'),
+      pieceId: inspect.pieceId,
+      sourceInspectId: inspect.id,
+      originalAnnealId: original.id,
+      reason: inspect.result as InspectResult,
+      state,
+      newAnnealId,
+      createdAt: stamp,
+      updatedAt: stamp,
+      revision: ROW_REVISION,
+    }
+    await db.reworks.put(rework)
+    return rework
+  })
+}
+
+/**
+ * 某作品有退火记录推进到「已出炉」后，释放等待中的重烧请求：
+ * 若作品当前已无「退火中」的炉（在烧的那炉确实出炉了），把待出炉的重烧请求退回待排（新开退火记录）。
+ * 返回本次释放的重烧请求数。
+ */
+export async function releaseReworksForPiece(pieceId: string): Promise<number> {
+  return db.transaction('rw', db.reworks, db.anneals, async () => {
+    const activeCount = await db.anneals
+      .where('pieceId')
+      .equals(pieceId)
+      .filter((a) => a.state === '退火中')
+      .count()
+    if (activeCount > 0) return 0 // 在烧的那炉还没出炉，不能打断
+
+    const pending = await db.reworks.where('pieceId').equals(pieceId).filter((r) => r.state === '待出炉').toArray()
+    if (pending.length === 0) return 0
+
+    const stamp = nowIso()
+    for (const rework of pending) {
+      const original = await db.anneals.get(rework.originalAnnealId)
+      const fallback: Anneal = {
+        id: '',
+        pieceId: rework.pieceId,
+        kilnSlot: '',
+        curveSeg: '缓冷',
+        inAt: '',
+        outAt: '',
+        state: '待入窑',
+        reworkOf: '',
+        sourceInspectId: '',
+        createdAt: stamp,
+        updatedAt: stamp,
+        revision: ROW_REVISION,
+      }
+      const newAnneal = buildReworkAnneal(rework.pieceId, original ?? fallback, rework.sourceInspectId, stamp)
+      await db.anneals.put(newAnneal)
+      await db.reworks.update(rework.id, { state: '已退回待排', newAnnealId: newAnneal.id, updatedAt: stamp })
+    }
+    return pending.length
+  })
+}
+
 /* ---------------------------- 整库快照 ---------------------------- */
 
 export interface DatabaseSnapshot {
@@ -307,22 +507,24 @@ export interface DatabaseSnapshot {
   steps: Step[]
   anneals: Anneal[]
   inspects: Inspect[]
+  reworks: ReworkRequest[]
 }
 
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [furnaces, batches, pieces, steps, anneals, inspects] = await Promise.all([
+  const [furnaces, batches, pieces, steps, anneals, inspects, reworks] = await Promise.all([
     db.furnaces.toArray(),
     db.batches.toArray(),
     db.pieces.toArray(),
     db.steps.toArray(),
     db.anneals.toArray(),
     db.inspects.toArray(),
+    db.reworks.toArray(),
   ])
-  return { name: DB_NAME, schemaVersion: DB_SCHEMA_VERSION, exportedAt: nowIso(), furnaces, batches, pieces, steps, anneals, inspects }
+  return { name: DB_NAME, schemaVersion: DB_SCHEMA_VERSION, exportedAt: nowIso(), furnaces, batches, pieces, steps, anneals, inspects, reworks }
 }
 
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
-  await db.transaction('rw', [db.furnaces, db.batches, db.pieces, db.steps, db.anneals, db.inspects], async () => {
+  await db.transaction('rw', [db.furnaces, db.batches, db.pieces, db.steps, db.anneals, db.inspects, db.reworks], async () => {
     await Promise.all([
       db.furnaces.clear(),
       db.batches.clear(),
@@ -330,6 +532,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
       db.steps.clear(),
       db.anneals.clear(),
       db.inspects.clear(),
+      db.reworks.clear(),
     ])
     await db.furnaces.bulkPut(snapshot.furnaces.map((row) => ({ ...row, revision: ROW_REVISION })))
     await db.batches.bulkPut(snapshot.batches.map((row) => ({ ...row, revision: ROW_REVISION })))
@@ -337,11 +540,12 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
     await db.steps.bulkPut(snapshot.steps.map((row) => ({ ...row, revision: ROW_REVISION })))
     await db.anneals.bulkPut(snapshot.anneals.map((row) => ({ ...row, revision: ROW_REVISION })))
     await db.inspects.bulkPut(snapshot.inspects.map((row) => ({ ...row, revision: ROW_REVISION })))
+    await db.reworks.bulkPut(snapshot.reworks.map((row) => ({ ...row, revision: ROW_REVISION })))
   })
 }
 
 export async function resetDatabase(): Promise<void> {
-  await db.transaction('rw', [db.furnaces, db.batches, db.pieces, db.steps, db.anneals, db.inspects], async () => {
+  await db.transaction('rw', [db.furnaces, db.batches, db.pieces, db.steps, db.anneals, db.inspects, db.reworks], async () => {
     await Promise.all([
       db.furnaces.clear(),
       db.batches.clear(),
@@ -349,19 +553,21 @@ export async function resetDatabase(): Promise<void> {
       db.steps.clear(),
       db.anneals.clear(),
       db.inspects.clear(),
+      db.reworks.clear(),
     ])
   })
   await seedDatabase()
 }
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [furnaces, batches, pieces, steps, anneals, inspects] = await Promise.all([
+  const [furnaces, batches, pieces, steps, anneals, inspects, reworks] = await Promise.all([
     db.furnaces.count(),
     db.batches.count(),
     db.pieces.count(),
     db.steps.count(),
     db.anneals.count(),
     db.inspects.count(),
+    db.reworks.count(),
   ])
-  return { furnaces, batches, pieces, steps, anneals, inspects }
+  return { furnaces, batches, pieces, steps, anneals, inspects, reworks }
 }

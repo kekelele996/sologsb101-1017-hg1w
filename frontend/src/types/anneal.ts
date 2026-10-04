@@ -29,6 +29,10 @@ export interface Anneal {
   outAt: string
   /** 退火状态 */
   state: AnnealState
+  /** 若本炉是重烧（返工）炉，指向原来那炉的退火记录 id；正常退火为空串 */
+  reworkOf: string
+  /** 触发重烧的检验记录 id；非重烧为空串 */
+  sourceInspectId: string
   createdAt: string
   updatedAt: string
   revision: number
